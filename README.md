@@ -48,9 +48,28 @@ position grows and the share price rises (`test_yieldFlowsToDepositors`).
 - Independent, clean-room implementation, **not audited**, **no mainnet deployment or TVL claimed**.
   Run the tests and get an independent audit before using with real funds. See [`DEPLOY.md`](./DEPLOY.md).
 
+## Deep dive (v2)
+
+A second adversarial pass found and fixed one **real bug**:
+
+- **Just-in-time interest skimming (fixed).** A `LendingMarket` only posts interest when it is
+  interacted with, so between pokes it carries earned-but-unposted interest. The vault priced shares
+  off `totalAssets()`, which read that *stale* value — so an attacker could deposit right before a
+  market was poked, mint shares against the lower NAV, and skim a slice of interest that belonged to
+  existing holders (and symmetrically, a holder redeeming pre-poke forfeited their pending interest
+  to whoever poked next). Demonstrated at ~4.7% of a fresh deposit in one year of pending interest.
+  **Fix:** `deposit`/`mint`/`withdraw`/`redeem` now accrue interest on every tracked market *before*
+  shares are priced, so entry/exit always uses a fresh NAV. Regressions:
+  `test_jitDeposit_cannotStealPendingInterest`, `test_redeem_accruesInterestBeforePricing`
+  (both fail if the pre-pricing accrual is removed).
+
+Also reviewed and found sound: cap enforcement across multiple deposits, rejection of untracked
+markets in queues, ERC-4626 rounding direction (always toward the vault), the virtual-shares
+inflation defense, withdraw-liquidity accounting, and reentrancy on the multi-market paths.
+
 ## Testing
 
-`forge test` — **11 tests, all green** (9 unit + 2 fuzzed solvency invariants at 64 runs × 200
+`forge test` — **15 tests, all green** (13 unit + 2 fuzzed solvency invariants at 64 runs × 200
 depth). The cap-allocation logic is mutation-checked. Solc 0.8.26, `via_ir`, cancun, OpenZeppelin v5.
 The `LendingMarket` / `LinearIrm` sources are vendored so this repo builds standalone; the canonical
 copies live in [isolated-lending](https://github.com/dngr2/isolated-lending).

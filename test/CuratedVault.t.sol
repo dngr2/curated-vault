@@ -157,4 +157,98 @@ contract CuratedVaultTest is Test {
         assertApproxEqAbs(vault.convertToAssets(vault.balanceOf(alice)), vault.convertToAssets(vault.balanceOf(bob)), 2);
         assertApproxEqAbs(vault.totalAssets(), 2000e18, 3);
     }
+
+    // ------------------------------------------------------------------
+    // DEEP DIVE (v2): adversarial coverage of the accrual/pricing boundary,
+    // cap enforcement, and market-set integrity.
+    // ------------------------------------------------------------------
+
+    /// A market only accrues on its own interactions, so between pokes it carries
+    /// earned-but-unposted interest. If entry priced shares against that stale NAV,
+    /// an attacker could deposit right before a poke and skim the pending interest
+    /// from existing holders. Regression: entry must accrue first, so the JIT
+    /// depositor gets back only their own principal and the existing holder keeps
+    /// 100% of the interest earned before the attacker arrived.
+    function test_jitDeposit_cannotStealPendingInterest() public {
+        _deposit(alice, 1000e18); // A=600, B=400
+
+        // borrower draws from market A; interest starts accruing
+        collA.mint(borrower, 1000e18);
+        vm.startPrank(borrower);
+        collA.approve(address(mA), 1000e18);
+        mA.supplyCollateral(1000e18, borrower);
+        mA.borrow(400e18, borrower, borrower);
+        vm.stopPrank();
+
+        vm.warp(T0 + 365 days); // ~93e18 interest earned, not yet posted to the vault
+
+        address attacker = makeAddr("attacker");
+        uint256 attackerShares = _deposit(attacker, 1000e18); // must accrue before pricing
+
+        mA.accrueInterest(); // realize the pending interest on-chain
+
+        // Attacker cannot extract more than the assets they put in.
+        uint256 attackerValue = vault.convertToAssets(attackerShares);
+        assertLe(attackerValue, 1000e18 + 1e15, "JIT depositor must not skim pending interest");
+
+        // The pre-existing holder keeps essentially all of the earned interest.
+        uint256 aliceValue = vault.convertToAssets(vault.balanceOf(alice));
+        assertGt(aliceValue, 1090e18, "existing holder keeps the pending interest");
+    }
+
+    /// Symmetric to the JIT-deposit case: a holder who redeems while interest is
+    /// pending must still be credited their share of it (exit accrues first),
+    /// instead of forfeiting it to whoever pokes the market afterwards.
+    function test_redeem_accruesInterestBeforePricing() public {
+        _deposit(alice, 1000e18);
+
+        collA.mint(borrower, 1000e18);
+        vm.startPrank(borrower);
+        collA.approve(address(mA), 1000e18);
+        mA.supplyCollateral(1000e18, borrower);
+        mA.borrow(100e18, borrower, borrower); // small draw => plenty of exit liquidity
+        vm.stopPrank();
+
+        vm.warp(T0 + 365 days); // interest accrues, not yet posted
+
+        uint256 half = vault.balanceOf(alice) / 2;
+        vm.prank(alice);
+        uint256 got = vault.redeem(half, alice, alice);
+
+        // Half the shares must be worth strictly more than half the raw principal,
+        // i.e. the redeemer's share of pending interest is included.
+        assertGt(got, 502e18, "redeemer must receive their share of pending interest");
+    }
+
+    /// The allocator can never push a market past its cap, even across several
+    /// deposits: fill A exactly to its cap, then a further deposit must overflow
+    /// into B (or idle) rather than exceeding the cap.
+    function test_cap_neverExceededAcrossDeposits() public {
+        vm.prank(curator);
+        vault.setCap(mB, 0); // only A has capacity (cap 600), rest idles
+
+        _deposit(alice, 400e18);
+        assertApproxEqAbs(mA.supplyAssetsOf(address(vault)), 400e18, 1);
+
+        _deposit(alice, 400e18); // A can take only 200 more; 200 must idle
+        assertApproxEqAbs(mA.supplyAssetsOf(address(vault)), 600e18, 2, "A capped at 600");
+        assertApproxEqAbs(loan.balanceOf(address(vault)), 200e18, 2, "overflow stays idle, cap respected");
+    }
+
+    /// A market not in the supply queue must never receive allocation, and a
+    /// non-tracked market cannot be placed in any queue.
+    function test_queue_rejectsUntrackedMarket() public {
+        MockERC20 collC = new MockERC20("CollC", "CC");
+        LendingMarket mC =
+            new LendingMarket(IERC20(address(loan)), IERC20(address(collC)), oracleA, irm, 0.8e18, address(0xF), 0);
+        LendingMarket[] memory q = new LendingMarket[](1);
+        q[0] = mC; // never added to the vault
+        vm.prank(curator);
+        vm.expectRevert(abi.encodeWithSelector(CuratedVault.NotTracked.selector, address(mC)));
+        vault.setSupplyQueue(q);
+
+        // and it never held any allocation
+        _deposit(alice, 100e18);
+        assertEq(mC.supplyAssetsOf(address(vault)), 0, "untracked market receives nothing");
+    }
 }

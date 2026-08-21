@@ -22,8 +22,10 @@ import {LendingMarket} from "./LendingMarket.sol";
 ///        privileged transfer path, only allocation policy. Depositors' downside is bounded by the
 ///        caps the curator sets, which are public. This is the MetaMorpho trust model, stated plainly.
 ///      - Inflation attack on deposit is defended by the virtual-shares offset.
-///      - `totalAssets()` reads each market's last-accrued supply value; a market accrues on its own
-///        interactions, so reported assets can lag until a market is poked (standard; documented).
+///      - `totalAssets()` (a view) reads each market's last-accrued supply value, so a pure read can
+///        lag until a market is poked. To prevent that lag from mispricing shares, every entry/exit
+///        (`deposit`/`mint`/`withdraw`/`redeem`) first accrues interest on all tracked markets, so
+///        shares are always minted/burned against a fresh NAV — no just-in-time interest skimming.
 contract CuratedVault is ERC4626, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -106,19 +108,35 @@ contract CuratedVault is ERC4626, Ownable, ReentrancyGuard {
 
     // --- reentrancy-guarded entry points ---
 
+    /// @notice Accrue interest on every tracked market so `totalAssets()` reflects all
+    ///         earned-but-unposted interest BEFORE shares are priced. Without this, entry/exit
+    ///         would price against a stale NAV, letting a just-in-time depositor mint shares
+    ///         cheaply right before a market is poked and skim pending interest from existing
+    ///         holders (and symmetrically shortchanging a redeemer who exits pre-accrual).
+    function _accrueMarkets() internal {
+        LendingMarket[] memory mkts = markets;
+        for (uint256 i; i < mkts.length; ++i) {
+            mkts[i].accrueInterest();
+        }
+    }
+
     function deposit(uint256 assets, address receiver) public override nonReentrant returns (uint256) {
+        _accrueMarkets();
         return super.deposit(assets, receiver);
     }
 
     function mint(uint256 shares, address receiver) public override nonReentrant returns (uint256) {
+        _accrueMarkets();
         return super.mint(shares, receiver);
     }
 
     function withdraw(uint256 assets, address receiver, address owner_) public override nonReentrant returns (uint256) {
+        _accrueMarkets();
         return super.withdraw(assets, receiver, owner_);
     }
 
     function redeem(uint256 shares, address receiver, address owner_) public override nonReentrant returns (uint256) {
+        _accrueMarkets();
         return super.redeem(shares, receiver, owner_);
     }
 
